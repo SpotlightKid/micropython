@@ -39,7 +39,7 @@
 #define MICROPY_HW_UART3_RTS    (pin_D12)
 #define MICROPY_HW_UART3_CTS    (pin_D11)
 #if MICROPY_HW_HAS_SWITCH == 0
-// NOTE: A0 also connects to the user switch. To use UART4 you should 
+// NOTE: A0 also connects to the user switch. To use UART4 you should
 //       set MICROPY_HW_HAS_SWITCH to 0, and also remove SB20 (on the back
 //       of the board near the USER switch).
 #define MICROPY_HW_UART4_TX     (pin_A0)
@@ -50,6 +50,11 @@
 //       be fine to use as a UART pin.
 #define MICROPY_HW_UART6_TX     (pin_C6)
 #define MICROPY_HW_UART6_RX     (pin_C7)
+
+// enable REPL on UART6
+#define MICROPY_HW_UART_REPL PYB_UART_6
+#define MICROPY_HW_UART_REPL_BAUD 115200
+
 
 // I2C busses
 #define MICROPY_HW_I2C1_SCL (pin_B6)
