@@ -63,6 +63,12 @@
 #include "can.h"
 #include "modnetwork.h"
 
+// include flash files converted to char arrays
+#include "genhdr/boot_py.h"
+#include "genhdr/main_py.h"
+#include "genhdr/readme_txt.h"
+#include "genhdr/pybcdc_inf.h"
+
 void SystemClock_Config(void);
 
 fs_user_mount_t fs_user_mount_flash;
@@ -130,40 +136,6 @@ STATIC mp_obj_t pyb_main(mp_uint_t n_args, const mp_obj_t *pos_args, mp_map_t *k
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(pyb_main_obj, 1, pyb_main);
 
-static const char fresh_boot_py[] =
-"# boot.py -- run on boot-up\r\n"
-"# can run arbitrary Python, but best to keep it minimal\r\n"
-"\r\n"
-"import machine\r\n"
-"import pyb\r\n"
-"#pyb.main('main.py') # main script to run after this one\r\n"
-"#pyb.usb_mode('CDC+MSC') # act as a serial and a storage device\r\n"
-"#pyb.usb_mode('CDC+HID') # act as a serial device and a mouse\r\n"
-;
-
-static const char fresh_main_py[] =
-"# main.py -- put your code here!\r\n"
-;
-
-static const char fresh_pybcdc_inf[] =
-#include "genhdr/pybcdc_inf.h"
-;
-
-static const char fresh_readme_txt[] =
-"This is a MicroPython board\r\n"
-"\r\n"
-"You can get started right away by writing your Python code in 'main.py'.\r\n"
-"\r\n"
-"For a serial prompt:\r\n"
-" - Windows: you need to go to 'Device manager', right click on the unknown device,\r\n"
-"   then update the driver software, using the 'pybcdc.inf' file found on this drive.\r\n"
-"   Then use a terminal program like Hyperterminal or putty.\r\n"
-" - Mac OS X: use the command: screen /dev/tty.usbmodem*\r\n"
-" - Linux: use the command: screen /dev/ttyACM0\r\n"
-"\r\n"
-"Please visit http://micropython.org/help/ for further help.\r\n"
-;
-
 // we don't make this function static because it needs a lot of stack and we
 // want it to be executed without using stack within main() function
 void init_flash_fs(uint reset_mode) {
@@ -203,18 +175,18 @@ void init_flash_fs(uint reset_mode) {
         FIL fp;
         f_open(&fp, "/flash/main.py", FA_WRITE | FA_CREATE_ALWAYS);
         UINT n;
-        f_write(&fp, fresh_main_py, sizeof(fresh_main_py) - 1 /* don't count null terminator */, &n);
+        f_write(&fp, main_py_data, main_py_len, &n);
         // TODO check we could write n bytes
         f_close(&fp);
 
         // create .inf driver file
         f_open(&fp, "/flash/pybcdc.inf", FA_WRITE | FA_CREATE_ALWAYS);
-        f_write(&fp, fresh_pybcdc_inf, sizeof(fresh_pybcdc_inf) - 1 /* don't count null terminator */, &n);
+        f_write(&fp, pybcdc_inf_data, pybcdc_inf_len, &n);
         f_close(&fp);
 
         // create readme file
         f_open(&fp, "/flash/README.txt", FA_WRITE | FA_CREATE_ALWAYS);
-        f_write(&fp, fresh_readme_txt, sizeof(fresh_readme_txt) - 1 /* don't count null terminator */, &n);
+        f_write(&fp, readme_txt_data, readme_txt_len, &n);
         f_close(&fp);
 
         // keep LED on for at least 200ms
@@ -257,7 +229,7 @@ void init_flash_fs(uint reset_mode) {
         FIL fp;
         f_open(&fp, "/flash/boot.py", FA_WRITE | FA_CREATE_ALWAYS);
         UINT n;
-        f_write(&fp, fresh_boot_py, sizeof(fresh_boot_py) - 1 /* don't count null terminator */, &n);
+        f_write(&fp, boot_py_data, boot_py_len, &n);
         // TODO check we could write n bytes
         f_close(&fp);
 
