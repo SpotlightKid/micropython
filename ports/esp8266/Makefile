@@ -23,6 +23,9 @@ FLASH_SIZE ?= detect
 CROSS_COMPILE = xtensa-lx106-elf-
 ESP_SDK = $(shell $(CC) -print-sysroot)/usr
 
+MAKE_IMG = $(PYTHON) $(CURDIR)/makeimg.py
+ESPTOOL ?= esptool.py
+
 INC += -I.
 INC += -I$(TOP)
 INC += -I$(BUILD)
@@ -168,19 +171,19 @@ FROZEN_EXTRA_DEPS = $(CONFVARS_FILE)
 
 deploy: $(BUILD)/firmware-combined.bin
 	$(ECHO) "Writing $< to the board"
-	$(Q)esptool.py --port $(PORT) --baud $(BAUD) write_flash --verify --flash_size=$(FLASH_SIZE) --flash_mode=$(FLASH_MODE) 0 $<
+	$(Q)$(ESPTOOL) --port $(PORT) --baud $(BAUD) write_flash --verify --flash_size=$(FLASH_SIZE) --flash_mode=$(FLASH_MODE) 0 $<
 
 erase:
 	$(ECHO) "Erase flash"
-	$(Q)esptool.py --port $(PORT) --baud $(BAUD) erase_flash
+	$(Q)$(ESPTOOL) --port $(PORT) --baud $(BAUD) erase_flash
 
 reset:
 	echo -e "\r\nimport machine; machine.reset()\r\n" >$(PORT)
 
 $(FWBIN): $(BUILD)/firmware.elf
 	$(ECHO) "Create $@"
-	$(Q)esptool.py elf2image $^
-	$(Q)$(PYTHON) makeimg.py $(BUILD)/firmware.elf-0x00000.bin $(BUILD)/firmware.elf-0x[0-5][1-f]000.bin $@
+	$(Q)$(ESPTOOL) elf2image $^
+	$(Q)$(MAKE_IMG) $(BUILD)/firmware.elf-0x00000.bin $(BUILD)/firmware.elf-0x[0-5][1-f]000.bin $@
 
 $(BUILD)/firmware.elf: $(OBJ)
 	$(ECHO) "LINK $@"
