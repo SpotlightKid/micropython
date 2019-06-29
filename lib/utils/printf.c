@@ -41,11 +41,7 @@
 int DEBUG_printf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    #ifndef MICROPY_DEBUG_PRINTER_DEST
-    #define MICROPY_DEBUG_PRINTER_DEST mp_plat_print
-    #endif
-    extern const mp_print_t MICROPY_DEBUG_PRINTER_DEST;
-    int ret = mp_vprintf(&MICROPY_DEBUG_PRINTER_DEST, fmt, ap);
+    int ret = mp_vprintf(MICROPY_DEBUG_PRINTER, fmt, ap);
     va_end(ap);
     return ret;
 }
@@ -103,9 +99,11 @@ STATIC void strn_print_strn(void *data, const char *str, size_t len) {
     strn_print_env->remain -= len;
 }
 
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ < 9
 // uClibc requires this alias to be defined, or there may be link errors
 // when linkings against it statically.
+// GCC 9 gives a warning about missing attributes so it's excluded until
+// uClibc+GCC9 support is needed.
 int __GI_vsnprintf(char *str, size_t size, const char *fmt, va_list ap) __attribute__((weak, alias ("vsnprintf")));
 #endif
 
