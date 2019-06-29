@@ -30,3 +30,6 @@
 [submodule "ports/stm32/boards/VCC_GND_F407"]
 	path = ports/stm32/boards/VCC_GND_F407
 	url = https://github.com/mcauser/VCC_GND_F407
+[submodule "ports/stm32/boards/BLACK_F407ZE"]
+	path = ports/stm32/boards/BLACK_F407ZE
+	url = https://github.com/mcauser/BLACK_F407ZE
