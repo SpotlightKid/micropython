@@ -112,6 +112,12 @@ STATIC const struct {
     { MP_QSTR_ENC_AB,             TIM_ENCODERMODE_TI12 },
 };
 
+enum {
+    BRK_OFF,
+    BRK_LOW,
+    BRK_HIGH,
+};
+
 typedef struct _pyb_timer_channel_obj_t {
     mp_obj_base_t base;
     struct _pyb_timer_obj_t *timer;
@@ -275,7 +281,7 @@ STATIC uint32_t compute_prescaler_period_from_freq(pyb_timer_obj_t *self, mp_obj
     uint32_t period;
     if (0) {
     #if MICROPY_PY_BUILTINS_FLOAT
-    } else if (MP_OBJ_IS_TYPE(freq_in, &mp_type_float)) {
+    } else if (mp_obj_is_type(freq_in, &mp_type_float)) {
         float freq = mp_obj_get_float(freq_in);
         if (freq <= 0) {
             goto bad_freq;
@@ -314,6 +320,40 @@ STATIC uint32_t compute_prescaler_period_from_freq(pyb_timer_obj_t *self, mp_obj
     return (prescaler - 1) & 0xffff;
 }
 
+// computes prescaler and period so TIM triggers with a period of t_num/t_den seconds
+STATIC uint32_t compute_prescaler_period_from_t(pyb_timer_obj_t *self, int32_t t_num, int32_t t_den, uint32_t *period_out) {
+    uint32_t source_freq = timer_get_source_freq(self->tim_id);
+    if (t_num <= 0 || t_den <= 0) {
+        mp_raise_ValueError("must have positive freq");
+    }
+    uint64_t period = (uint64_t)source_freq * (uint64_t)t_num / (uint64_t)t_den;
+    uint32_t prescaler = 1;
+    while (period > TIMER_CNT_MASK(self)) {
+        // if we can divide exactly, and without prescaler overflow, do that first
+        if (prescaler <= 13107 && period % 5 == 0) {
+            prescaler *= 5;
+            period /= 5;
+        } else if (prescaler <= 21845 && period % 3 == 0) {
+            prescaler *= 3;
+            period /= 3;
+        } else {
+            // may not divide exactly, but loses minimal precision
+            uint32_t period_lsb = period & 1;
+            prescaler <<= 1;
+            period >>= 1;
+            if (period < prescaler) {
+                // round division up
+                prescaler |= period_lsb;
+            }
+            if (prescaler > 0x10000) {
+                mp_raise_ValueError("period too large");
+            }
+        }
+    }
+    *period_out = (period - 1) & TIMER_CNT_MASK(self);
+    return (prescaler - 1) & 0xffff;
+}
+
 // Helper function for determining the period used for calculating percent
 STATIC uint32_t compute_period(pyb_timer_obj_t *self) {
     // In center mode,  compare == period corresponds to 100%
@@ -336,7 +376,7 @@ STATIC uint32_t compute_pwm_value_from_percent(uint32_t period, mp_obj_t percent
     uint32_t cmp;
     if (0) {
     #if MICROPY_PY_BUILTINS_FLOAT
-    } else if (MP_OBJ_IS_TYPE(percent_in, &mp_type_float)) {
+    } else if (mp_obj_is_type(percent_in, &mp_type_float)) {
         mp_float_t percent = mp_obj_get_float(percent_in);
         if (percent <= 0.0) {
             cmp = 0;
@@ -428,14 +468,20 @@ STATIC mp_int_t compute_ticks_from_dtg(uint32_t dtg) {
     return 512 + ((dtg & 0x1F) * 16);
 }
 
-STATIC void config_deadtime(pyb_timer_obj_t *self, mp_int_t ticks) {
+STATIC void config_deadtime(pyb_timer_obj_t *self, mp_int_t ticks, mp_int_t brk) {
     TIM_BreakDeadTimeConfigTypeDef deadTimeConfig;
     deadTimeConfig.OffStateRunMode  = TIM_OSSR_DISABLE;
     deadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
     deadTimeConfig.LockLevel        = TIM_LOCKLEVEL_OFF;
     deadTimeConfig.DeadTime         = compute_dtg_from_ticks(ticks);
-    deadTimeConfig.BreakState       = TIM_BREAK_DISABLE;
-    deadTimeConfig.BreakPolarity    = TIM_BREAKPOLARITY_LOW;
+    deadTimeConfig.BreakState       = brk == BRK_OFF ? TIM_BREAK_DISABLE : TIM_BREAK_ENABLE;
+    deadTimeConfig.BreakPolarity    = brk == BRK_LOW ? TIM_BREAKPOLARITY_LOW : TIM_BREAKPOLARITY_HIGH;
+    #if defined(STM32F7) || defined(STM32H7) | defined(STM32L4)
+    deadTimeConfig.BreakFilter      = 0;
+    deadTimeConfig.Break2State      = TIM_BREAK_DISABLE;
+    deadTimeConfig.Break2Polarity   = TIM_BREAKPOLARITY_LOW;
+    deadTimeConfig.Break2Filter     = 0;
+    #endif
     deadTimeConfig.AutomaticOutput  = TIM_AUTOMATICOUTPUT_DISABLE;
     HAL_TIMEx_ConfigBreakDeadTime(&self->tim, &deadTimeConfig);
 }
@@ -478,6 +524,12 @@ STATIC void pyb_timer_print(const mp_print_t *print, mp_obj_t self_in, mp_print_
         {
             mp_printf(print, ", deadtime=%u",
                 compute_ticks_from_dtg(self->tim.Instance->BDTR & TIM_BDTR_DTG));
+            if ((self->tim.Instance->BDTR & TIM_BDTR_BKE) == TIM_BDTR_BKE) {
+                mp_printf(print, ", brk=%s",
+                    ((self->tim.Instance->BDTR & TIM_BDTR_BKP) == TIM_BDTR_BKP) ? "BRK_HIGH" : "BRK_LOW");
+            } else {
+                mp_printf(print, ", brk=BRK_OFF");
+            }
         }
         mp_print_str(print, ")");
     }
@@ -527,16 +579,25 @@ STATIC void pyb_timer_print(const mp_print_t *print, mp_obj_t self_in, mp_print_
 ///       measures ticks of `source_freq` divided by `div` clock ticks.
 ///       `deadtime` is only available on timers 1 and 8.
 ///
+///   - `brk` - specifies if the break mode is used to kill the output of
+///       the PWM when the BRK_IN input is asserted. The polarity set how the
+///       BRK_IN input is triggered. It can be set to `BRK_OFF`, `BRK_LOW`
+///       and `BRK_HIGH`.
+///
+///
 ///  You must either specify freq or both of period and prescaler.
 STATIC mp_obj_t pyb_timer_init_helper(pyb_timer_obj_t *self, size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_freq, ARG_prescaler, ARG_period, ARG_tick_hz, ARG_mode, ARG_div, ARG_callback, ARG_deadtime, ARG_brk };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_freq,         MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_PTR(&mp_const_none_obj)} },
         { MP_QSTR_prescaler,    MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0xffffffff} },
         { MP_QSTR_period,       MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0xffffffff} },
+        { MP_QSTR_tick_hz,      MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 1000} },
         { MP_QSTR_mode,         MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = TIM_COUNTERMODE_UP} },
         { MP_QSTR_div,          MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 1} },
         { MP_QSTR_callback,     MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_PTR(&mp_const_none_obj)} },
         { MP_QSTR_deadtime,     MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_brk,          MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = BRK_OFF} },
     };
 
     // parse args
@@ -546,25 +607,28 @@ STATIC mp_obj_t pyb_timer_init_helper(pyb_timer_obj_t *self, size_t n_args, cons
     // set the TIM configuration values
     TIM_Base_InitTypeDef *init = &self->tim.Init;
 
-    if (args[0].u_obj != mp_const_none) {
+    if (args[ARG_freq].u_obj != mp_const_none) {
         // set prescaler and period from desired frequency
-        init->Prescaler = compute_prescaler_period_from_freq(self, args[0].u_obj, &init->Period);
-    } else if (args[1].u_int != 0xffffffff && args[2].u_int != 0xffffffff) {
+        init->Prescaler = compute_prescaler_period_from_freq(self, args[ARG_freq].u_obj, &init->Period);
+    } else if (args[ARG_prescaler].u_int != 0xffffffff && args[ARG_period].u_int != 0xffffffff) {
         // set prescaler and period directly
-        init->Prescaler = args[1].u_int;
-        init->Period = args[2].u_int;
+        init->Prescaler = args[ARG_prescaler].u_int;
+        init->Period = args[ARG_period].u_int;
+    } else if (args[ARG_period].u_int != 0xffffffff) {
+        // set prescaler and period from desired period and tick_hz scale
+        init->Prescaler = compute_prescaler_period_from_t(self, args[ARG_period].u_int, args[ARG_tick_hz].u_int, &init->Period);
     } else {
-        mp_raise_TypeError("must specify either freq, or prescaler and period");
+        mp_raise_TypeError("must specify either freq, period, or prescaler and period");
     }
 
-    init->CounterMode = args[3].u_int;
+    init->CounterMode = args[ARG_mode].u_int;
     if (!IS_TIM_COUNTER_MODE(init->CounterMode)) {
         nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ValueError, "invalid mode (%d)", init->CounterMode));
     }
 
-    init->ClockDivision = args[4].u_int == 2 ? TIM_CLOCKDIVISION_DIV2 :
-                          args[4].u_int == 4 ? TIM_CLOCKDIVISION_DIV4 :
-                                               TIM_CLOCKDIVISION_DIV1;
+    init->ClockDivision = args[ARG_div].u_int == 2 ? TIM_CLOCKDIVISION_DIV2 :
+                          args[ARG_div].u_int == 4 ? TIM_CLOCKDIVISION_DIV4 :
+                                                     TIM_CLOCKDIVISION_DIV1;
 
     init->RepetitionCounter = 0;
 
@@ -572,7 +636,9 @@ STATIC mp_obj_t pyb_timer_init_helper(pyb_timer_obj_t *self, size_t n_args, cons
     switch (self->tim_id) {
         case 1: __HAL_RCC_TIM1_CLK_ENABLE(); break;
         case 2: __HAL_RCC_TIM2_CLK_ENABLE(); break;
+        #if defined(TIM3)
         case 3: __HAL_RCC_TIM3_CLK_ENABLE(); break;
+        #endif
         #if defined(TIM4)
         case 4: __HAL_RCC_TIM4_CLK_ENABLE(); break;
         #endif
@@ -638,7 +704,8 @@ STATIC mp_obj_t pyb_timer_init_helper(pyb_timer_obj_t *self, size_t n_args, cons
     #else
     if (0) {
     #endif
-        config_deadtime(self, args[6].u_int);
+        config_deadtime(self, args[ARG_deadtime].u_int, args[ARG_brk].u_int);
+
     }
 
     // Enable ARPE so that the auto-reload register is buffered.
@@ -646,10 +713,10 @@ STATIC mp_obj_t pyb_timer_init_helper(pyb_timer_obj_t *self, size_t n_args, cons
     self->tim.Instance->CR1 |= TIM_CR1_ARPE;
 
     // Start the timer running
-    if (args[5].u_obj == mp_const_none) {
+    if (args[ARG_callback].u_obj == mp_const_none) {
         HAL_TIM_Base_Start(&self->tim);
     } else {
-        pyb_timer_callback(MP_OBJ_FROM_PTR(self), args[5].u_obj);
+        pyb_timer_callback(MP_OBJ_FROM_PTR(self), args[ARG_callback].u_obj);
     }
 
     return mp_const_none;
@@ -667,7 +734,9 @@ STATIC const uint32_t tim_instance_table[MICROPY_HW_MAX_TIMER] = {
     TIM_ENTRY(1, TIM1_UP_TIM16_IRQn),
     #endif
     TIM_ENTRY(2, TIM2_IRQn),
+    #if defined(TIM3)
     TIM_ENTRY(3, TIM3_IRQn),
+    #endif
     #if defined(TIM4)
     TIM_ENTRY(4, TIM4_IRQn),
     #endif
@@ -945,7 +1014,7 @@ STATIC mp_obj_t pyb_timer_channel(size_t n_args, const mp_obj_t *pos_args, mp_ma
 
     mp_obj_t pin_obj = args[2].u_obj;
     if (pin_obj != mp_const_none) {
-        if (!MP_OBJ_IS_TYPE(pin_obj, &pin_type)) {
+        if (!mp_obj_is_type(pin_obj, &pin_type)) {
             mp_raise_ValueError("pin argument needs to be be a Pin type");
         }
         const pin_obj_t *pin = MP_OBJ_TO_PTR(pin_obj);
@@ -1088,7 +1157,9 @@ STATIC mp_obj_t pyb_timer_channel(size_t n_args, const mp_obj_t *pos_args, mp_ma
             // Only Timers 1, 2, 3, 4, 5, and 8 support encoder mode
             if (self->tim.Instance != TIM1
             &&  self->tim.Instance != TIM2
+            #if defined(TIM3)
             &&  self->tim.Instance != TIM3
+            #endif
             #if defined(TIM4)
             &&  self->tim.Instance != TIM4
             #endif
@@ -1262,6 +1333,9 @@ STATIC const mp_rom_map_elem_t pyb_timer_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_RISING), MP_ROM_INT(TIM_ICPOLARITY_RISING) },
     { MP_ROM_QSTR(MP_QSTR_FALLING), MP_ROM_INT(TIM_ICPOLARITY_FALLING) },
     { MP_ROM_QSTR(MP_QSTR_BOTH), MP_ROM_INT(TIM_ICPOLARITY_BOTHEDGE) },
+    { MP_ROM_QSTR(MP_QSTR_BRK_OFF), MP_ROM_INT(BRK_OFF) },
+    { MP_ROM_QSTR(MP_QSTR_BRK_LOW), MP_ROM_INT(BRK_LOW) },
+    { MP_ROM_QSTR(MP_QSTR_BRK_HIGH), MP_ROM_INT(BRK_HIGH) },
 };
 STATIC MP_DEFINE_CONST_DICT(pyb_timer_locals_dict, pyb_timer_locals_dict_table);
 
