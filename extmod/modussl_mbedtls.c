@@ -4,6 +4,7 @@
  * The MIT License (MIT)
  *
  * Copyright (c) 2016 Linaro Ltd.
+ * Copyright (c) 2019 Paul Sokolovsky
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -36,7 +37,6 @@
 
 // mbedtls_time_t
 #include "mbedtls/platform.h"
-#include "mbedtls/net.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/pk.h"
@@ -61,6 +61,7 @@ struct ssl_args {
     mp_arg_val_t cert;
     mp_arg_val_t server_side;
     mp_arg_val_t server_hostname;
+    mp_arg_val_t do_handshake;
 };
 
 STATIC const mp_obj_type_t ussl_socket_type;
@@ -185,10 +186,12 @@ STATIC mp_obj_ssl_socket_t *socket_new(mp_obj_t sock, struct ssl_args *args) {
         assert(ret == 0);
     }
 
-    while ((ret = mbedtls_ssl_handshake(&o->ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            printf("mbedtls_ssl_handshake error: -%x\n", -ret);
-            goto cleanup;
+    if (args->do_handshake.u_bool) {
+        while ((ret = mbedtls_ssl_handshake(&o->ssl)) != 0) {
+            if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                printf("mbedtls_ssl_handshake error: -%x\n", -ret);
+                goto cleanup;
+            }
         }
     }
 
@@ -239,6 +242,11 @@ STATIC mp_uint_t socket_read(mp_obj_t o_in, void *buf, mp_uint_t size, int *errc
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
         ret = MP_EWOULDBLOCK;
+    } else if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        // If handshake is not finished, read attempt may end up in protocol
+        // wanting to write next handshake message. The same may happen with
+        // renegotation.
+        ret = MP_EWOULDBLOCK;
     }
     *errcode = ret;
     return MP_STREAM_ERROR;
@@ -252,6 +260,11 @@ STATIC mp_uint_t socket_write(mp_obj_t o_in, const void *buf, mp_uint_t size, in
         return ret;
     }
     if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        ret = MP_EWOULDBLOCK;
+    } else if (ret == MBEDTLS_ERR_SSL_WANT_READ) {
+        // If handshake is not finished, write attempt may end up in protocol
+        // wanting to read next handshake message. The same may happen with
+        // renegotation.
         ret = MP_EWOULDBLOCK;
     }
     *errcode = ret;
@@ -270,23 +283,17 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_2(socket_setblocking_obj, socket_setblocking);
 
 STATIC mp_uint_t socket_ioctl(mp_obj_t o_in, mp_uint_t request, uintptr_t arg, int *errcode) {
     mp_obj_ssl_socket_t *self = MP_OBJ_TO_PTR(o_in);
-    (void)arg;
-    switch (request) {
-        case MP_STREAM_CLOSE:
-            mbedtls_pk_free(&self->pkey);
-            mbedtls_x509_crt_free(&self->cert);
-            mbedtls_x509_crt_free(&self->cacert);
-            mbedtls_ssl_free(&self->ssl);
-            mbedtls_ssl_config_free(&self->conf);
-            mbedtls_ctr_drbg_free(&self->ctr_drbg);
-            mbedtls_entropy_free(&self->entropy);
-            mp_stream_close(self->sock);
-            return 0;
-
-        default:
-            *errcode = MP_EINVAL;
-            return MP_STREAM_ERROR;
+    if (request == MP_STREAM_CLOSE) {
+        mbedtls_pk_free(&self->pkey);
+        mbedtls_x509_crt_free(&self->cert);
+        mbedtls_x509_crt_free(&self->cacert);
+        mbedtls_ssl_free(&self->ssl);
+        mbedtls_ssl_config_free(&self->conf);
+        mbedtls_ctr_drbg_free(&self->ctr_drbg);
+        mbedtls_entropy_free(&self->entropy);
     }
+    // Pass all requests down to the underlying socket
+    return mp_get_stream(self->sock)->ioctl(self->sock, request, arg, errcode);
 }
 
 STATIC const mp_rom_map_elem_t ussl_socket_locals_dict_table[] = {
@@ -327,7 +334,8 @@ STATIC mp_obj_t mod_ssl_wrap_socket(size_t n_args, const mp_obj_t *pos_args, mp_
         { MP_QSTR_key, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
         { MP_QSTR_cert, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
         { MP_QSTR_server_side, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
-        { MP_QSTR_server_hostname, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_server_hostname, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_PTR(&mp_const_none_obj)} },
+        { MP_QSTR_do_handshake, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
     };
 
     // TODO: Check that sock implements stream protocol
